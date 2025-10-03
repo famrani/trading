@@ -1,0 +1,11 @@
+server/node_modules/
+server/dist/
+server/dist2/
+server/clientportal.gw
+server/sslKeys
+server/stocks
+server/*.csv
+server/.DS_Store
+.DS_Store
+server/.env
+*.csv
