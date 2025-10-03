@@ -1,0 +1,13 @@
+[
+  {
+    "symbol": "MRVL",
+    "side": "BUY",
+    "datetime": "2025-10-03T13:55:01.170Z",
+    "price": 85.81,
+    "shares": 582,
+    "profit": 0,
+    "newCapital": 50000,
+    "tradeIndex": 1,
+    "reason": "RULE"
+  }
+]

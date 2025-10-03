@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "symbol": "MRVL",
+  "mode": "long",
+  "equity": 50000,
+  "entryPrice": 85.81,
+  "shares": 582,
+  "tradeCounter": 1,
+  "pendingExitQty": 0,
+  "currentOcaGroup": "POS_MRVL_1759499701169",
+  "params": {
+    "x": 2,
+    "y": 2,
+    "multiple": 1,
+    "bucketMins": 1,
+    "tickSize": 0.01,
+    "eodClose": false,
+    "tz": "America/New_York"
+  }
+}
