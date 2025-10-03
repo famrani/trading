@@ -1,0 +1,1 @@
+npx ts-node trading-bot.ts --symbol mrvl --capital 50000 --multiple 1 --mode long --x 2 --y 2 --bucketMins 1 --eodClose false --txDir ./out/amzn --account S --clientId 103
