@@ -6,6 +6,7 @@ server/sslKeys
 server/stocks
 server/*.csv
 server/.DS_Store
+server/--account
 .DS_Store
 server/.env
 *.csv
