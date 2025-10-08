@@ -1,1 +1,1 @@
-npx ts-node src/trading-bot.ts --symbol amzn --capital 60000 --multiple 1 --mode long --x 2 --y 2 --bucketMins 1 --eodClose false --txDir --account P --clientId 103 --takePct 0.5 --takeAmt 100
+npx ts-node src/trading-bot.ts --symbol amzn --capital 50000 --multiple 1 --mode long --x 3 --y 2 --bucketMins 1 --eodClose false --txDir --account P --clientId 103 --takePct 1 --takeAmt 100 --resetEquity true
