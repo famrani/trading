@@ -126,6 +126,7 @@ switch (accountFlag) {
   case "A": ibAccount = "U7914923"; ibPort = 7496; break;
   case "S": ibAccount = "DUH673915"; ibPort = 7497; break;
   case "F": ibAccount = "U11743275"; ibPort = 7496; break;
+  case "I": ibAccount = "U6466931"; ibPort = 7496; break;
 }
 const ib = new IBApi({ host: "127.0.0.1", port: ibPort, clientId });
 
