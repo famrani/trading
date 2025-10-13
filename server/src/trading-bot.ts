@@ -1,30 +1,28 @@
 // trading-bot.ts
-// Bucketed streak strategy with MARKET exits on profit (TAKE & RULE), duplicate-order prevention,
-// RESUME support, startup reconciliation (cancel only legacy open orders),
-// periodic position watcher, fractional bucket support (e.g., 0.5 min), and colored logs.
+// Bucketed streak strategy with TAKE-PROFIT-ONLY exits (LIMIT orders),
+// duplicate-order prevention, RESUME support, startup reconciliation
+// (cancel only legacy open orders), periodic position watcher,
+// optional Telegram notifications, and colored logs for uPnL.
 //
-// Exit triggers now:
-//   1) TAKE by dollars: pnl >= takeAmt     (MKT)
-//   2) TAKE by percent of CLI capital: pnl >= (takePct/100) * capital   (MKT)
-//   3) RULE profit exit: LONG if upStreak >= y and pnl>0; SHORT if downStreak >= x and pnl>0  (MKT)
-//
-// Notes:
-// - Entries remain LIMIT (LMT) at the sampled price.
-// - EOD liquidations remain LIMIT to preserve profit-gating behavior.
-// - Use --resetEquity to force equity = --capital on startup (otherwise resume from state).
+// KEY POINTS:
+// - All bucket-based exits (upStreak==y & profit>0) are removed.
+// - Exits occur ONLY when TAKE-PROFIT is met.
+// - TAKE-PROFIT trigger uses the MIN of (takeAmt, takePct * positionCost).
+// - Exits are sent as LIMIT orders with a price that preserves at least `tickSize` profit.
 //
 // Example:
 //   npx ts-node trading-bot.ts \
-//     --symbol NVDA --capital 100000 --multiple 1 --mode short \
-//     --x 2 --y 3 --bucketMins 0.5 --eodClose false \
+//     --symbol AMZN --capital 60000 --multiple 1 --mode long \
+//     --x 2 --y 2 --bucketMins 1 --eodClose false \
 //     --takePct 0.5 --takeAmt 50 \
-//     --tz America/New_York --txDir ./out --account S --clientId 301 --resetEquity true
+//     --tz America/New_York --txDir ./out --account P --clientId 103
 //
 // Dependencies:
 //   npm i @stoqey/ib
 //
 import * as fs from "fs";
 import * as path from "path";
+import * as https from "https";
 import { IBApi, EventName, ErrorCode, Contract, OrderState } from "@stoqey/ib";
 
 // ---------- CLI ----------
@@ -39,21 +37,6 @@ function parseBool(s: string | undefined, def: boolean) {
   if (["true", "1", "yes", "y"].includes(v)) return true;
   if (["false", "0", "no", "n"].includes(v)) return false;
   return def;
-}
-
-// ---------- ANSI colors ----------
-const C = {
-  reset: "\x1b[0m",
-  red: "\x1b[31m",
-  green: "\x1b[32m",
-  yellow: "\x1b[33m",
-  dim: "\x1b[2m",
-};
-function colorPnL(n: number): string {
-  const s = n.toFixed(2);
-  if (n > 0) return `${C.green}${s}${C.reset}`;
-  if (n < 0) return `${C.red}${s}${C.reset}`;
-  return s;
 }
 
 // ---------- Types ----------
@@ -104,30 +87,33 @@ type BotState = {
 
 // ---------- Params ----------
 const symbol = (arg("symbol") || "NVDA").toUpperCase();
-const capital = numArg("capital", 10000); // used for percent-of-capital TAKE
+const capital = numArg("capital", 10000);
 const multiple = Math.max(1, Math.min(2, numArg("multiple", 1)));
 const mode = (arg("mode", "long")!.toLowerCase() as SideMode); // long|short
-const x = numArg("x", 2); // LONG: enter trigger; SHORT: exit trigger
-const y = numArg("y", 2); // LONG: exit trigger;  SHORT: enter trigger
-const bucketMins = Math.max(0.1, Number(arg("bucketMins", "1"))); // allow fractional minutes like 0.5
-const stopPct = arg("stopPct") ? Number(arg("stopPct")) : undefined; // optional stop (profit-gated)
-const takePct = arg("takePct") ? Number(arg("takePct")) : undefined; // optional TAKE % target (of CLI capital)
-const takeAmt = arg("takeAmt") ? Number(arg("takeAmt")) : undefined; // optional TAKE absolute $ target
-const eodClose = parseBool(arg("eodClose"), false);
+const x = numArg("x", 2); // LONG: enter trigger; SHORT: exit trigger (still used for entry rules)
+const y = numArg("y", 2); // LONG: exit trigger (IGNORED NOW); SHORT: enter trigger
+const bucketMins = Math.max(0.1, numArg("bucketMins", 1)); // allow fractional minutes
+const stopPct = undefined; // ⛔ disabled (stop exits removed)
+const takePct = arg("takePct") ? Number(arg("takePct")) : undefined; // % of position cost
+const takeAmt = arg("takeAmt") ? Number(arg("takeAmt")) : undefined; // absolute $ target
+const eodClose = false; // ⛔ disabled (exits only via take-profit)
 const tz = arg("tz", "America/New_York")!;
 const txDir = arg("txDir", ".")!;
-const tickSize = numArg("tickSize", 0.01); // for EOD LMT only
+const tickSize = numArg("tickSize", 0.01); // min price improvement to guarantee profit on LIMIT exits
 const accountFlag = (arg("account", "S") || "S").toUpperCase();
 const clientId = numArg("clientId", 22);
-const resetEquity = parseBool(arg("resetEquity"), false);
 
+// Telegram (optional)
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+
+// Validate
 if (!fs.existsSync(txDir)) fs.mkdirSync(txDir, { recursive: true });
 if (!(capital > 0)) throw new Error("--capital must be > 0");
 if (!(multiple >= 1 && multiple <= 2)) throw new Error("--multiple must be in [1,2]");
 if (!["long", "short"].includes(mode)) throw new Error("--mode must be 'long' or 'short'");
 if (!(x > 0 && Number.isInteger(x))) throw new Error("--x must be positive integer");
 if (!(y > 0 && Number.isInteger(y))) throw new Error("--y must be positive integer");
-if (stopPct !== undefined && (!(stopPct > 0) || stopPct >= 100)) throw new Error("--stopPct must be in (0,100)");
 if (takePct !== undefined && (!(takePct > 0) || takePct >= 100)) throw new Error("--takePct must be in (0,100)");
 if (takeAmt !== undefined && !(takeAmt > 0)) throw new Error("--takeAmt must be > 0");
 if (!(tickSize > 0)) throw new Error("--tickSize must be > 0");
@@ -154,7 +140,6 @@ let inPosition = false;
 let entryPrice = 0;
 let shares = 0; // long > 0, short < 0
 let tradeCounter = 0;
-let stopLevel = Number.NaN;
 
 let lastPrice = 0;          // live LAST
 let prevSamplePrice = 0;    // previous bucket sample
@@ -180,19 +165,20 @@ const dailyAgg = new Map<string, { profit: number; capital: number; lastTs: numb
 
 const mktDataTickerId = 9101;
 
-// ---- Startup reconciliation controls ----
-let reconcilingOpenOrders = false;
-let firstLocalOrderIdStart = -1;     // the floor for "our new" orders
-const cancelledOnce = new Set<number>();
-
-// ---- Position polling snapshot ----
-let posSnapshotActive = false;
+// ---- Position polling buffer ----
 let posBuffer: { symbol: string; pos: number; avgCost: number }[] = [];
 
-// ---- Bucket debounce ----
-let lastBucketKey = "";
-
 // ---------- Helpers ----------
+const ansi = {
+  reset: "\x1b[0m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  dim: "\x1b[2m",
+};
+function colorPnL(v: number): string {
+  const s = v.toFixed(2);
+  return v >= 0 ? `${ansi.green}${s}${ansi.reset}` : `${ansi.red}${s}${ansi.reset}`;
+}
 function ibStockContract(sym: string): Contract {
   return { symbol: sym, secType: "STK", exchange: "SMART", currency: "USD" } as Contract;
 }
@@ -208,14 +194,6 @@ function hhmmss(now: Date) {
   }).formatToParts(now);
   const get = (t: string) => Number(parts.find(p => p.type === t)?.value ?? "0");
   return `${pad2(get("hour"))}:${pad2(get("minute"))}:${pad2(get("second"))}`;
-}
-function bucketKey(d: Date): string {
-  // Include seconds so fractional-minute buckets get unique keys
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz, hour12: false, year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit"
-  }).format(d);
-  return parts; // "YYYY-MM-DD, HH:MM:SS"
 }
 function writeTxAndDaily() {
   try { fs.writeFileSync(txFile, JSON.stringify(txLog, null, 2), "utf8"); } catch {}
@@ -233,7 +211,7 @@ function saveState() {
     entryPrice,
     shares,
     tradeCounter,
-    stopPct,
+    stopPct,     // stays undefined (disabled)
     takePct,
     takeAmt,
     pendingExitQty,
@@ -250,16 +228,7 @@ function loadStateIfAny() {
     if (s.mode !== mode) {
       console.log(`ℹ️ State file mode (${s.mode}) != current mode (${mode}); keeping current mode.`);
     }
-    const priorEquity = s.equity ?? equity;
-    if (resetEquity) {
-      equity = capital;
-      console.log(`💾 Loaded state but overriding equity with CLI: stateEquity=${priorEquity.toFixed(2)} → equity=${equity.toFixed(2)} (--resetEquity)`);
-    } else {
-      equity = priorEquity;
-      if (Math.abs(priorEquity - capital) > 0.001) {
-        console.log(`💾 Loaded state equity=${priorEquity.toFixed(2)} (CLI capital=${capital.toFixed(2)}). Pass --resetEquity true to override.`);
-      }
-    }
+    equity = s.equity ?? equity;
     entryPrice = s.entryPrice ?? 0;
     shares = s.shares ?? 0;
     tradeCounter = s.tradeCounter ?? 0;
@@ -291,7 +260,6 @@ function recordFlat(profit: number, price: number, reason: TxRecord["reason"], w
   inPosition = false;
   entryPrice = 0;
   shares = 0;
-  stopLevel = Number.NaN;
   pendingExitQty = 0;
   Array.from(openExitOrderIds).forEach((id) => { try { ib.cancelOrder(id); } catch {} });
   openExitOrderIds.clear();
@@ -299,12 +267,6 @@ function recordFlat(profit: number, price: number, reason: TxRecord["reason"], w
 
   writeTxAndDaily();
   saveState();
-}
-function profitableSellLimit(current: number, entry: number): number {
-  return Math.max(current, entry + tickSize);
-}
-function profitableCoverLimit(current: number, entry: number): number {
-  return Math.min(current, entry - tickSize);
 }
 function ensureNoFlip() {
   if (mode === "long" && shares < 0) {
@@ -323,38 +285,40 @@ function ensureNoFlip() {
   }
 }
 
-// ---------- Timers (fractional minutes supported) ----------
-function alignToNextBucketMs(now: Date, minutes: number): number {
-  // Align to next boundary of 'minutes' (can be fractional), in tz.
-  const fmt = new Intl.DateTimeFormat("en-US", {
-    timeZone: tz, hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit"
-  });
-  const parts = fmt.formatToParts(now);
-  const get = (t: string) => Number(parts.find(p => p.type === t)?.value ?? "0");
-  const sec = get("second");
-  const min = get("minute");
-
-  const minsIntoHour = min + sec / 60;
-  const interval = minutes;
-  const nextMultiple = Math.ceil(minsIntoHour / interval) * interval;
-  let deltaMins = nextMultiple - minsIntoHour;
-  if (deltaMins <= 0) deltaMins += interval;
-  const msToBoundary = Math.max(50, Math.round(deltaMins * 60 * 1000));
-  return msToBoundary;
+// Profitable LIMIT helpers
+function profitableSellLimit(current: number, entry: number): number {
+  return Math.max(current, entry + tickSize);
+}
+function profitableCoverLimit(current: number, entry: number): number {
+  return Math.min(current, entry - tickSize);
 }
 
+// Telegram notify (optional)
+function notifyTelegram(text: string) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+  const payload = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, disable_web_page_preview: true });
+  const opts: https.RequestOptions = {
+    hostname: "api.telegram.org",
+    path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) }
+  };
+  const req = https.request(opts, (res) => { res.on("data", () => {}); });
+  req.on("error", () => {});
+  req.write(payload);
+  req.end();
+}
+
+// ---------- Timers ----------
 function startBucketTimer() {
-  const kickoff = () => {
+  // simple interval scheduler to support fractional minutes
+  const intervalMs = Math.max(1000, Math.round(bucketMins * 60_000));
+  console.log(`⏱️  Bucket timer: every ${bucketMins} min(s) (~${Math.round(intervalMs/1000)}s)`);
+
+  const tick = () => {
     const now = new Date();
-    const key = bucketKey(now);
-    if (key === lastBucketKey) { scheduleNext(); return; }
-    lastBucketKey = key;
-
-    const t = hhmmss(now);
-
     if (lastPrice <= 0) {
-      console.log(`[${t}] ${symbol} (bucket) no price yet; skipping sample`);
-      scheduleNext();
+      console.log(`[${hhmmss(now)}] ${symbol} (bucket) no price yet; skipping sample`);
       return;
     }
 
@@ -362,8 +326,7 @@ function startBucketTimer() {
     if (!haveFirstSample) {
       haveFirstSample = true;
       prevSamplePrice = sample;
-      console.log(`[${t}] ${symbol} (bucket) init sample=${sample.toFixed(4)} | mode=${mode} | holding=${inPosition ? shares : 0}`);
-      scheduleNext();
+      console.log(`[${hhmmss(now)}] ${symbol} (bucket) init sample=${sample.toFixed(4)} | mode=${mode} | holding=${inPosition ? shares : 0}`);
       return;
     }
 
@@ -376,80 +339,20 @@ function startBucketTimer() {
       downStreak = 0; upStreak = 0;
     }
 
-    const pnlSample = inPosition ? (sample - entryPrice) * shares : 0;
     const arrow = sample > prevSamplePrice ? "▲" : sample < prevSamplePrice ? "▼" : "=";
-    const extra = inPosition
-      ? ` | entry=${entryPrice.toFixed(4)} | uPnL=${colorPnL(pnlSample)} | pendingExitQty=${pendingExitQty}`
-      : "";
-    console.log(`[${t}] ${symbol} (bucket) sampled=${sample.toFixed(4)} ${arrow} (downStreak=${downStreak}, upStreak=${upStreak}) | mode=${mode} | holding=${inPosition ? shares : 0}${extra}`);
+    const uPnL = inPosition ? (sample - entryPrice) * shares : 0;
+    const extra = inPosition ? ` | entry=${entryPrice.toFixed(4)} | uPnL=${colorPnL(uPnL)} | pendingExitQty=${pendingExitQty}` : "";
+    console.log(`[${hhmmss(now)}] ${symbol} (bucket) sampled=${sample.toFixed(4)} ${arrow} (down=${downStreak}, up=${upStreak}) | mode=${mode} | holding=${inPosition ? shares : 0}${extra}`);
 
-    // decisions at bucket boundaries only (RULE exits use >= and MARKET)
-    maybeExitOnSample(sample, now).catch(() => {});
-    maybeEnterOnSample(sample, now).catch(() => {});
-
+    // decisions at bucket boundaries only (ENTRY only; EXIT removed)
+    maybeEnterOnSample(sample).catch(() => {});
     prevSamplePrice = sample;
-    scheduleNext();
   };
 
-  const scheduleNext = () => {
-    const ms = alignToNextBucketMs(new Date(), bucketMins);
-    setTimeout(kickoff, ms);
-  };
-
-  const firstMs = alignToNextBucketMs(new Date(), bucketMins);
-  console.log(`⏱️  Bucket timer: every ${bucketMins} min(s), next in ~${Math.round(firstMs/1000)}s`);
-  setTimeout(kickoff, firstMs);
+  setInterval(tick, intervalMs);
 }
 
-// ---------- EOD ----------
-async function eodLiquidationIfNeeded(now: Date) {
-  if (!eodClose || !inPosition) return;
-  if (hasOutstandingOrders()) { console.log("🌙 EOD skip: outstanding order present"); return; }
-
-  if (mode === "long") {
-    if (!(lastPrice > entryPrice)) {
-      console.log(`🌙 EOD HOLD (not profitable, long): last=${lastPrice.toFixed(4)} ≤ entry=${entryPrice.toFixed(4)}`);
-      return;
-    }
-    const qtyToExit = Math.max(0, Math.abs(shares) - pendingExitQty);
-    if (qtyToExit <= 0) { console.log(`🌙 EOD SELL skipped: pending exits already cover`); return; }
-    const lmt = profitableSellLimit(lastPrice, entryPrice);
-    if (!currentOcaGroup) currentOcaGroup = `POS_${symbol}_${Date.now()}`;
-    const order: any = { action: "SELL", totalQuantity: qtyToExit, orderType: "LMT", lmtPrice: lmt, tif: "DAY", transmit: true, ocaGroup: currentOcaGroup, ocaType: 1 };
-    const oid = placeOrderSafe(ibStockContract(symbol), order, "SELL", "EXIT", "EOD", qtyToExit, currentOcaGroup);
-    if (oid < 0) return;
-    pendingExitQty += qtyToExit;
-    console.log(`🌙 EOD SELL LMT ORDER id=${oid} ${qtyToExit}/${shares} ${symbol} @ ${lmt.toFixed(4)} | lastSeen=${lastPrice.toFixed(4)} | entry=${entryPrice.toFixed(4)} | pendingExitQty=${pendingExitQty}`);
-  } else {
-    if (!(lastPrice < entryPrice)) {
-      console.log(`🌙 EOD HOLD (not profitable, short): last=${lastPrice.toFixed(4)} ≥ entry=${entryPrice.toFixed(4)}`);
-      return;
-    }
-    const qtyToExit = Math.max(0, Math.abs(shares) - pendingExitQty);
-    if (qtyToExit <= 0) { console.log(`🌙 EOD COVER skipped: pending exits already cover`); return; }
-    const lmt = profitableCoverLimit(lastPrice, entryPrice);
-    if (!currentOcaGroup) currentOcaGroup = `POS_${symbol}_${Date.now()}`;
-    const order: any = { action: "BUY", totalQuantity: qtyToExit, orderType: "LMT", lmtPrice: lmt, tif: "DAY", transmit: true, ocaGroup: currentOcaGroup, ocaType: 1 };
-    const oid = placeOrderSafe(ibStockContract(symbol), order, "BUY", "EXIT", "EOD", qtyToExit, currentOcaGroup);
-    if (oid < 0) return;
-    pendingExitQty += qtyToExit;
-    console.log(`🌙 EOD COVER LMT ORDER id=${oid} ${qtyToExit}/${Math.abs(shares)} ${symbol} @ ${lmt.toFixed(4)} | lastSeen=${lastPrice.toFixed(4)} | entry=${entryPrice.toFixed(4)} | pendingExitQty=${pendingExitQty}`);
-  }
-}
-function startEODTimer() {
-  if (!eodClose) return;
-  setInterval(async () => {
-    const now = new Date();
-    const hm = new Intl.DateTimeFormat("en-US", {
-      timeZone: tz, hour12: false, hour: "2-digit", minute: "2-digit"
-    }).format(now);
-    if (hm === "15:59") {
-      await eodLiquidationIfNeeded(now);
-    }
-  }, 15_000);
-}
-
-// ---- Duplicate-order prevention ----
+// ---------- Duplicate-order prevention ----------
 function hasOutstandingOrders(): boolean {
   if (openEntryOrderId !== null) return true;
   if (openExitOrderIds.size > 0) return true;
@@ -488,8 +391,8 @@ function placeOrderSafe(
 // ---------- Strategy (bucket sample decisions) ----------
 // ENTER rules:
 //   LONG: enter BUY when downStreak == X
-//   SHORT: enter SELL when upStreak == Y   (mapping for symmetry)
-async function maybeEnterOnSample(samplePrice: number, when: Date) {
+//   SHORT: enter SELL when upStreak == Y
+async function maybeEnterOnSample(samplePrice: number) {
   if (inPosition) return; // cannot enter if position != 0
   if (hasOutstandingOrders()) { console.log("➤ NO ENTRY: outstanding order present"); return; }
 
@@ -522,130 +425,54 @@ async function maybeEnterOnSample(samplePrice: number, when: Date) {
   }
 }
 
-// EXIT rules (profit-only) — now MARKET & >= for streak:
-//   LONG: exit SELL when upStreak >= Y and pnl>0
-//   SHORT: exit COVER/BUY when downStreak >= X and pnl>0
-async function maybeExitOnSample(samplePrice: number, when: Date) {
+// ---------- TAKE-PROFIT (ONLY) on tick ----------
+async function checkTakeOnTick(price: number) {
   if (!inPosition) return;
-  if (hasOutstandingOrders()) { console.log("➤ NO EXIT: outstanding order present"); return; }
-
-  const pnlSample = (samplePrice - entryPrice) * shares; // pnl > 0 means profitable
-
-  if (mode === "long") {
-    if (!(upStreak >= y && pnlSample > 0)) return;
-    const qtyToExit = Math.max(0, Math.abs(shares) - pendingExitQty);
-    if (qtyToExit <= 0) { console.log(`➤ SKIP SELL: pending exits already cover position`); return; }
-
-    if (!currentOcaGroup) currentOcaGroup = `POS_${symbol}_${Date.now()}`;
-    const order: any = { action: "SELL", totalQuantity: qtyToExit, orderType: "MKT", tif: "DAY", transmit: true, ocaGroup: currentOcaGroup, ocaType: 1 };
-    const oid = placeOrderSafe(ibStockContract(symbol), order, "SELL", "EXIT", "RULE", qtyToExit, currentOcaGroup);
-    if (oid < 0) return;
-    pendingExitQty += qtyToExit;
-    downStreak = 0; upStreak = 0;
-    console.log(`🔴 SELL MKT ORDER id=${oid} ${qtyToExit}/${shares} ${symbol} | RULE exit (upStreak>=${y} & pnl>0)`);
-    saveState();
-  } else {
-    // SHORT: cover when downStreak >= X and pnl>0 (profit)
-    if (!(downStreak >= x && pnlSample > 0)) return;
-    const qtyToExit = Math.max(0, Math.abs(shares) - pendingExitQty);
-    if (qtyToExit <= 0) { console.log(`➤ SKIP COVER: pending exits already cover short`); return; }
-
-    if (!currentOcaGroup) currentOcaGroup = `POS_${symbol}_${Date.now()}`;
-    const order: any = { action: "BUY", totalQuantity: qtyToExit, orderType: "MKT", tif: "DAY", transmit: true, ocaGroup: currentOcaGroup, ocaType: 1 };
-    const oid = placeOrderSafe(ibStockContract(symbol), order, "BUY", "EXIT", "RULE", qtyToExit, currentOcaGroup);
-    if (oid < 0) return;
-    pendingExitQty += qtyToExit;
-    downStreak = 0; upStreak = 0;
-    console.log(`🟩 COVER MKT ORDER id=${oid} ${qtyToExit}/${Math.abs(shares)} ${symbol} | RULE exit (downStreak>=${x} & pnl>0)`);
-    saveState();
-  }
-}
-
-// TAKE-PROFIT on tick (MARKET) — OR between $ and % of CLI capital
-async function checkTakeOnTick(price: number, when: Date) {
-  if (!inPosition || (takePct === undefined && takeAmt === undefined)) return;
   if (hasOutstandingOrders()) return;
 
-  const pnlNow = (price - entryPrice) * shares; // sign-safe for long/short
+  // realized-if-exited-now P&L (works for long & short)
+  const pnlNow = (price - entryPrice) * shares;
 
-  let trigger = false;
-  let reasons: string[] = [];
+  // Build dollar target using MIN(takeAmt, takePct * positionCost).
+  const positionCost = Math.abs(shares) * entryPrice;
+  const pctDollar = (takePct !== undefined) ? (positionCost * (takePct / 100)) : Number.POSITIVE_INFINITY;
+  const amtDollar = (takeAmt !== undefined) ? takeAmt : Number.POSITIVE_INFINITY;
+  const target = Math.min(pctDollar, amtDollar);
 
-  if (takeAmt !== undefined && pnlNow >= takeAmt) {
-    trigger = true; reasons.push(`$>=${takeAmt.toFixed(2)}`);
-  }
-  if (takePct !== undefined) {
-    const pctTarget = (takePct / 100) * capital; // percent of CLI capital
-    if (pnlNow >= pctTarget) {
-      trigger = true; reasons.push(`%>=${takePct}% of capital (${pctTarget.toFixed(2)})`);
-    }
-  }
+  if (!isFinite(target)) return; // no target configured
 
-  if (!trigger) return;
+  if (pnlNow < target) return;
 
   const qtyToExit = Math.max(0, Math.abs(shares) - pendingExitQty);
   if (qtyToExit <= 0) return;
 
+  if (!currentOcaGroup) currentOcaGroup = `POS_${symbol}_${Date.now()}`;
+
   if (mode === "long") {
-    if (!currentOcaGroup) currentOcaGroup = `POS_${symbol}_${Date.now()}`;
-    const order: any = { action: "SELL", totalQuantity: qtyToExit, orderType: "MKT", tif: "DAY", transmit: true, ocaGroup: currentOcaGroup, ocaType: 1 };
+    // LIMIT SELL to realize profit: ensure lmt >= entry + tickSize and not worse than current
+    const lmt = profitableSellLimit(price, entryPrice);
+    const order: any = { action: "SELL", totalQuantity: qtyToExit, orderType: "LMT", lmtPrice: lmt, tif: "DAY", transmit: true, ocaGroup: currentOcaGroup, ocaType: 1 };
     const oid = placeOrderSafe(ibStockContract(symbol), order, "SELL", "EXIT", "TAKE", qtyToExit, currentOcaGroup);
     if (oid < 0) return;
     pendingExitQty += qtyToExit;
-    console.log(`🎯 TAKE-PROFIT SELL MKT id=${oid} ${qtyToExit}/${shares} ${symbol} | pnlNow=${colorPnL(pnlNow)} | by=${reasons.join(" OR ")}`);
+    console.log(`🎯 TAKE SELL LMT id=${oid} ${qtyToExit}/${shares} ${symbol} @ ${lmt.toFixed(4)} | uPnL=${colorPnL(pnlNow)} | target=${target.toFixed(2)} (min of ${isFinite(pctDollar)?pctDollar.toFixed(2):"—"} & ${isFinite(amtDollar)?amtDollar.toFixed(2):"—"})`);
+    notifyTelegram(`🎯 TAKE SELL LMT ${symbol} qty=${qtyToExit} @ ${lmt.toFixed(2)} | uPnL=${pnlNow.toFixed(2)} target=${target.toFixed(2)}`);
     saveState();
   } else {
-    if (!currentOcaGroup) currentOcaGroup = `POS_${symbol}_${Date.now()}`;
-    const order: any = { action: "BUY", totalQuantity: qtyToExit, orderType: "MKT", tif: "DAY", transmit: true, ocaGroup: currentOcaGroup, ocaType: 1 };
+    // LIMIT BUY (cover) to realize profit on short: ensure lmt <= entry - tickSize and not worse than current
+    const lmt = profitableCoverLimit(price, entryPrice);
+    const order: any = { action: "BUY", totalQuantity: qtyToExit, orderType: "LMT", lmtPrice: lmt, tif: "DAY", transmit: true, ocaGroup: currentOcaGroup, ocaType: 1 };
     const oid = placeOrderSafe(ibStockContract(symbol), order, "BUY", "EXIT", "TAKE", qtyToExit, currentOcaGroup);
     if (oid < 0) return;
     pendingExitQty += qtyToExit;
-    console.log(`🎯 TAKE-PROFIT COVER MKT id=${oid} ${qtyToExit}/${Math.abs(shares)} ${symbol} | pnlNow=${colorPnL(pnlNow)} | by=${reasons.join(" OR ")}`);
+    console.log(`🎯 TAKE COVER LMT id=${oid} ${qtyToExit}/${Math.abs(shares)} ${symbol} @ ${lmt.toFixed(4)} | uPnL=${colorPnL(pnlNow)} | target=${target.toFixed(2)} (min of ${isFinite(pctDollar)?pctDollar.toFixed(2):"—"} & ${isFinite(amtDollar)?amtDollar.toFixed(2):"—"})`);
+    notifyTelegram(`🎯 TAKE COVER LMT ${symbol} qty=${qtyToExit} @ ${lmt.toFixed(2)} | uPnL=${pnlNow.toFixed(2)} target=${target.toFixed(2)}`);
     saveState();
-  }
-}
-
-// Optional profit-only stop (LIMIT) on tick — unchanged & profit-gated
-async function checkStopOnTick(price: number, when: Date) {
-  if (!inPosition || !stopPct) return;
-  if (hasOutstandingOrders()) return;
-
-  if (mode === "long") {
-    if (!(price > entryPrice)) return; // profit-only gating
-    const currStop = entryPrice * (1 - stopPct / 100);
-    if (!Number.isNaN(currStop) && price <= currStop) {
-      const qtyToExit = Math.max(0, Math.abs(shares) - pendingExitQty);
-      if (qtyToExit <= 0) return;
-      const lmt = profitableSellLimit(price, entryPrice);
-      if (!currentOcaGroup) currentOcaGroup = `POS_${symbol}_${Date.now()}`;
-      const order: any = { action: "SELL", totalQuantity: qtyToExit, orderType: "LMT", lmtPrice: lmt, tif: "DAY", transmit: true, ocaGroup: currentOcaGroup, ocaType: 1 };
-      const oid = placeOrderSafe(ibStockContract(symbol), order, "SELL", "EXIT", "STOP", qtyToExit, currentOcaGroup);
-      if (oid < 0) return;
-      pendingExitQty += qtyToExit;
-      console.log(`⛔ STOP SELL LMT ORDER id=${oid} ${qtyToExit}/${shares} ${symbol} @ ${lmt.toFixed(4)} | price=${price.toFixed(4)}`);
-      saveState();
-    }
-  } else {
-    if (!(price < entryPrice)) return; // profit-only gating for short
-    const currStop = entryPrice * (1 + stopPct / 100);
-    if (!Number.isNaN(currStop) && price >= currStop) {
-      const qtyToExit = Math.max(0, Math.abs(shares) - pendingExitQty);
-      if (qtyToExit <= 0) return;
-      const lmt = profitableCoverLimit(price, entryPrice);
-      if (!currentOcaGroup) currentOcaGroup = `POS_${symbol}_${Date.now()}`;
-      const order: any = { action: "BUY", totalQuantity: qtyToExit, orderType: "LMT", lmtPrice: lmt, tif: "DAY", transmit: true, ocaGroup: currentOcaGroup, ocaType: 1 };
-      const oid = placeOrderSafe(ibStockContract(symbol), order, "BUY", "EXIT", "STOP", qtyToExit, currentOcaGroup);
-      if (oid < 0) return;
-      pendingExitQty += qtyToExit;
-      console.log(`⛔ STOP COVER LMT ORDER id=${oid} ${qtyToExit}/${Math.abs(shares)} ${symbol} @ ${lmt.toFixed(4)} | price=${price.toFixed(4)}`);
-      saveState();
-    }
   }
 }
 
 // ---------- Position polling / reconciliation ----------
 function pollPositionsOnce() {
-  posSnapshotActive = true;
   posBuffer = [];
   ib.reqPositions();
 }
@@ -674,7 +501,7 @@ async function main() {
     firstLocalOrderIdStart = oid;     // anything >= this is our new order
     console.log(`✅ Connected. nextValidId = ${oid} | mode=${mode.toUpperCase()} (startup reconciliation ON)`);
 
-    // Subscribe LAST ticks (for bucket & stop/take)
+    // Subscribe LAST ticks (for bucket & take)
     ib.reqMktData(mktDataTickerId, ibStockContract(symbol), "", false, false);
 
     // Reconcile with live world (startup-only) + ongoing watcher
@@ -684,11 +511,10 @@ async function main() {
 
     // Start timers
     startBucketTimer();
-    startEODTimer();
   });
 
   // Cancel ONLY legacy open orders (startup reconciliation window only)
-  ib.on(EventName.openOrder, (orderId: number, contract: Contract, order: any, orderState: OrderState) => {
+  ib.on(EventName.openOrder, (orderId: number, contract: Contract, _order: any, _orderState: OrderState) => {
     if ((contract?.symbol || "").toUpperCase() !== symbol) return;
     if (!reconcilingOpenOrders) return;
     if (firstLocalOrderIdStart >= 0 && orderId >= firstLocalOrderIdStart) return;
@@ -713,16 +539,12 @@ async function main() {
 
   // Positions: gather snapshot rows during poll
   ib.on(EventName.position, (_account, contract, pos, avgCost) => {
-    if (!posSnapshotActive) return;
     const sym = (contract?.symbol || "").toUpperCase();
     if (sym) posBuffer.push({ symbol: sym, pos, avgCost: Number(avgCost) || 0 });
   });
 
   // Snapshot end → reconcile
   ib.on("positionEnd" as any, () => {
-    if (!posSnapshotActive) return;
-    posSnapshotActive = false;
-
     const row = posBuffer.find(r => r.symbol === symbol);
     const exchangeSaysPos = row?.pos ?? 0;
     const exchangeAvgCost = row?.avgCost ?? 0;
@@ -738,7 +560,6 @@ async function main() {
       inPosition = false;
       shares = 0;
       entryPrice = 0;
-      stopLevel = Number.NaN;
 
       txLog.push({
         symbol,
@@ -746,7 +567,7 @@ async function main() {
         datetime: new Date().toISOString(),
         price: lastPrice || 0,
         shares: 0,
-        profit: 0,                  // realized PnL happened outside the bot
+        profit: 0,
         newCapital: equity,
         tradeIndex: tradeCounter,
         reason: "RULE",
@@ -773,15 +594,13 @@ async function main() {
         inPosition = true;
         shares = adoptShares;
         entryPrice = exchangeAvgCost || entryPrice;
-        stopLevel = (stopPct && inPosition)
-          ? (mode === "long" ? entryPrice * (1 - stopPct / 100) : entryPrice * (1 + stopPct / 100))
-          : Number.NaN;
         pendingExitQty = 0;
         openEntryOrderId = null;
         openExitOrderIds.clear();
         currentOcaGroup = `POS_${symbol}_${Date.now()}`;
 
-        console.log(`🧭 Adopted live position from IB: shares=${shares}, entry=${entryPrice.toFixed(4)}, stop=${isNaN(stopLevel) ? "none" : stopLevel.toFixed(4)}`);
+        console.log(`🧭 Adopted live position from IB: shares=${shares}, entry=${entryPrice.toFixed(4)}`);
+        notifyTelegram(`🧭 Adopted ${symbol} position: shares=${shares}, entry=${entryPrice.toFixed(4)}`);
         saveState();
       }
     }
@@ -791,9 +610,6 @@ async function main() {
       console.log(`🔄 Position size changed externally for ${symbol}: ${shares} → ${exchangeSaysPos}. Syncing.`);
       shares = exchangeSaysPos;
       if (exchangeAvgCost > 0) entryPrice = exchangeAvgCost;
-      stopLevel = (stopPct && inPosition)
-        ? (mode === "long" ? entryPrice * (1 - stopPct / 100) : entryPrice * (1 + stopPct / 100))
-        : Number.NaN;
 
       pendingExitQty = 0;
       openExitOrderIds.clear();
@@ -836,12 +652,12 @@ async function main() {
 
         if (mode === "long") {
           shares = meta.qty;
-          stopLevel = stopPct ? entryPrice * (1 - stopPct / 100) : Number.NaN;
-          console.log(`🟢 BUY FILLED id=${orderId} ${shares} ${symbol} @ ${entryPrice.toFixed(4)} | stop=${isNaN(stopLevel) ? "none" : stopLevel.toFixed(4)}`);
+          console.log(`🟢 BUY FILLED id=${orderId} ${shares} ${symbol} @ ${entryPrice.toFixed(4)}`);
+          notifyTelegram(`🟢 BUY FILLED ${symbol} qty=${shares} @ ${entryPrice.toFixed(4)}`);
         } else {
           shares = -meta.qty;
-          stopLevel = stopPct ? entryPrice * (1 + stopPct / 100) : Number.NaN;
-          console.log(`🟥 SHORT FILLED id=${orderId} ${meta.qty} ${symbol} @ ${entryPrice.toFixed(4)} | stop=${isNaN(stopLevel) ? "none" : stopLevel.toFixed(4)}`);
+          console.log(`🟥 SHORT FILLED id=${orderId} ${meta.qty} ${symbol} @ ${entryPrice.toFixed(4)}`);
+          notifyTelegram(`🟥 SHORT FILLED ${symbol} qty=${meta.qty} @ ${entryPrice.toFixed(4)}`);
         }
 
         pendingExitQty = 0;
@@ -882,14 +698,15 @@ async function main() {
         if (shares === 0) {
           recordFlat(realized, exitPrice, meta.reason, new Date());
           console.log(
-            `${meta.reason === "TAKE" ? "🎯" : meta.reason === "STOP" ? "⛔" : meta.reason === "EOD" ? "🌙" : (mode === "long" ? "🔴" : "🟩")} ` +
-            `${mode === "long" ? "SELL" : "COVER"} FILLED id=${orderId} ALL ${symbol} @ ${exitPrice.toFixed(4)} | reason=${meta.reason} | P&L=${colorPnL(realized)} | equity=${equity.toFixed(2)}`
+            `✅ ${mode === "long" ? "SELL" : "COVER"} FILLED id=${orderId} ALL ${symbol} @ ${exitPrice.toFixed(4)} | reason=${meta.reason} | P&L=${colorPnL(realized)} | equity=${equity.toFixed(2)}`
           );
+          notifyTelegram(`✅ ${mode === "long" ? "SELL" : "COVER"} FILLED ${symbol} ALL @ ${exitPrice.toFixed(4)} | P&L=${realized.toFixed(2)} | equity=${equity.toFixed(2)}`);
         } else {
           equity += realized;
           console.log(
-            `${mode === "long" ? "🔴 SELL" : "🟩 COVER"} FILLED id=${orderId} ${exitQty} ${symbol} @ ${exitPrice.toFixed(4)} | reason=${meta.reason} | Realized=${colorPnL(realized)} | equity=${equity.toFixed(2)} | remaining=${Math.abs(shares)}`
+            `✅ PARTIAL ${mode === "long" ? "SELL" : "COVER"} id=${orderId} ${exitQty} ${symbol} @ ${exitPrice.toFixed(4)} | reason=${meta.reason} | Realized=${colorPnL(realized)} | equity=${equity.toFixed(2)} | remaining=${Math.abs(shares)}`
           );
+          notifyTelegram(`✅ PARTIAL ${mode === "long" ? "SELL" : "COVER"} ${symbol} qty=${exitQty} @ ${exitPrice.toFixed(4)} | Realized=${realized.toFixed(2)} | equity=${equity.toFixed(2)} | rem=${Math.abs(shares)}`);
           saveState();
         }
       }
@@ -908,15 +725,15 @@ async function main() {
 
     const now = new Date();
     const t = hhmmss(now);
-    const uPnL = inPosition ? (price - entryPrice) * shares : 0;
+    const uPnL = inPosition ? ((price - entryPrice) * shares) : 0;
     console.log(
       `[${t}] ${symbol} last=${price.toFixed(4)} | mode=${mode} | holding=${inPosition ? shares : 0}`
       + (inPosition ? ` | entry=${entryPrice.toFixed(4)} | uPnL=${colorPnL(uPnL)} | pendingExitQty=${pendingExitQty} | entryOrd=${openEntryOrderId ?? "none"} | exitOrds=${openExitOrderIds.size}` : "")
       + ` | streaks(d=${downStreak},u=${upStreak})`
     );
 
-    try { await checkTakeOnTick(price, now); } catch {}
-    try { await checkStopOnTick(price, now); } catch {}
+    try { await checkTakeOnTick(price); } catch {}
+    // ⛔ stop exits are disabled
   });
 
   // Connect
@@ -938,6 +755,10 @@ async function main() {
 }
 
 // ---------- Startup reconciliation helpers ----------
+let reconcilingOpenOrders = false;
+let firstLocalOrderIdStart = -1;
+const cancelledOnce = new Set<number>();
+
 function beginOpenOrderReconciliation() {
   reconcilingOpenOrders = true;
   cancelledOnce.clear();
