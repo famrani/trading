@@ -14,6 +14,8 @@
 //   (If allowUnprofitableRuleExit is true, the 10 EUR restriction is ignored)
 // - TAKE-AMT exits:
 //     * Trigger when PnL >= max(10 EUR, takeAmt)
+// - Tick snapping:
+//     * All LIMIT prices are snapped to exchange tick (fixes IB 110 error).
 // - Extra safety: 15s cooldown between ENTRY orders (per process, per symbol).
 //
 // Example:
@@ -221,6 +223,21 @@ function usd(n: number): string {
   const s = (Number.isFinite(n) ? n : 0).toFixed(2);
   return `$${s}`;
 }
+
+// --- TICK ROUNDING HELPERS (fix IB code 110) ---
+function roundToTick(v: number, tick = tickSize): number {
+  const n = Math.round((v + 1e-9) / tick);
+  return Number((n * tick).toFixed(6));
+}
+function roundUpToTick(v: number, tick = tickSize): number {
+  const n = Math.ceil((v - 1e-9) / tick);
+  return Number((n * tick).toFixed(6));
+}
+function roundDownToTick(v: number, tick = tickSize): number {
+  const n = Math.floor((v + 1e-9) / tick);
+  return Number((n * tick).toFixed(6));
+}
+
 function writeTxAndDaily() {
   try { fs.writeFileSync(txFile, JSON.stringify(txLog, null, 2), "utf8"); } catch { }
   const rows = Array.from(dailyAgg.entries())
@@ -230,7 +247,7 @@ function writeTxAndDaily() {
 }
 function saveState() {
   const state: BotState = {
-    version: 9,
+    version: 10,
     symbol,
     mode,
     equity,
@@ -320,16 +337,18 @@ function ensureNoFlip() {
   }
 }
 
-// LIMIT helpers (prefer Bid/Ask)
+// LIMIT helpers (prefer Bid/Ask) + tick snap
 function chooseSellLimitForLong(bid: number, entry: number, fallback: number): number {
   const minProfitable = entry + tickSize;
   const base = (bid > 0 ? bid : fallback);
-  return Math.max(base, minProfitable);
+  // want at least minProfitable; SELL limit rounded DOWN to valid tick
+  return roundDownToTick(Math.max(base, minProfitable));
 }
 function chooseCoverLimitForShort(ask: number, entry: number, fallback: number): number {
   const minProfitable = entry - tickSize;
   const base = (ask > 0 ? ask : fallback);
-  return Math.min(base, minProfitable);
+  // want at most minProfitable; BUY limit rounded UP to valid tick
+  return roundUpToTick(Math.min(base, minProfitable));
 }
 
 // Telegram notify (optional)
@@ -451,16 +470,18 @@ async function maybeEnterOnSample(samplePrice: number) {
     return;
   }
 
-  const positionValue = equity * multiple;
-  const qty = Math.floor(positionValue / samplePrice);
-  if (qty <= 0) {
-    console.log(`➤ NO ENTRY (size=0) | sampled=${samplePrice.toFixed(4)} | equity=${equity} | multiple=${multiple}x`);
-    return;
-  }
-
   if (mode === "long") {
     if (downStreak >= x) {
-      const order: any = { action: "BUY", totalQuantity: qty, orderType: "LMT", lmtPrice: samplePrice, tif: "DAY", transmit: true };
+      // round entry price UP for BUY limit
+      const lmtBuy = roundUpToTick(samplePrice);
+      // compute qty from rounded price to avoid qty mismatch
+      const positionValue = equity * multiple;
+      const qty = Math.floor(positionValue / lmtBuy);
+      if (qty <= 0) {
+        console.log(`➤ NO ENTRY (size=0) | lmt=${lmtBuy.toFixed(4)} | equity=${equity} | multiple=${multiple}x`);
+        return;
+      }
+      const order: any = { action: "BUY", totalQuantity: qty, orderType: "LMT", lmtPrice: lmtBuy, tif: "DAY", transmit: true };
       const oid = placeOrderSafe(ibStockContract(symbol), order, "BUY", "ENTRY", "RULE", qty);
       if (oid < 0) return;
 
@@ -468,21 +489,29 @@ async function maybeEnterOnSample(samplePrice: number) {
       // reset streaks on entry
       upStreak = 0; downStreak = 0;
 
-      console.log(`🟢 BUY LMT ORDER id=${oid} ${qty} ${symbol} @ ${samplePrice.toFixed(4)} | trigger: downStreak>=${x} | equity=${equity.toFixed(2)}`);
-      notifyTelegram(`🟢 BUY LMT ${symbol} qty=${qty} @ ${samplePrice.toFixed(2)} | downStreak>=${x}`);
+      console.log(`🟢 BUY LMT ORDER id=${oid} ${qty} ${symbol} @ ${lmtBuy.toFixed(4)} | trigger: downStreak>=${x} | equity=${equity.toFixed(2)}`);
+      notifyTelegram(`🟢 BUY LMT ${symbol} qty=${qty} @ ${lmtBuy.toFixed(2)} | downStreak>=${x}`);
       saveState();
     }
   } else {
     if (upStreak >= y) {
-      const order: any = { action: "SELL", totalQuantity: qty, orderType: "LMT", lmtPrice: samplePrice, tif: "DAY", transmit: true };
+      // round entry price DOWN for SELL short limit
+      const lmtShort = roundDownToTick(samplePrice);
+      const positionValue = equity * multiple;
+      const qty = Math.floor(positionValue / lmtShort);
+      if (qty <= 0) {
+        console.log(`➤ NO ENTRY (size=0) | lmt=${lmtShort.toFixed(4)} | equity=${equity} | multiple=${multiple}x`);
+        return;
+      }
+      const order: any = { action: "SELL", totalQuantity: qty, orderType: "LMT", lmtPrice: lmtShort, tif: "DAY", transmit: true };
       const oid = placeOrderSafe(ibStockContract(symbol), order, "SELL", "ENTRY", "RULE", qty);
       if (oid < 0) return;
 
       lastEntryAttemptMs = nowMs;
       upStreak = 0; downStreak = 0;
 
-      console.log(`🟥 SHORT LMT ORDER id=${oid} ${qty} ${symbol} @ ${samplePrice.toFixed(4)} | trigger: upStreak>=${y} | equity=${equity.toFixed(2)}`);
-      notifyTelegram(`🟥 SHORT LMT ${symbol} qty=${qty} @ ${samplePrice.toFixed(2)} | upStreak>=${y}`);
+      console.log(`🟥 SHORT LMT ORDER id=${oid} ${qty} ${symbol} @ ${lmtShort.toFixed(4)} | trigger: upStreak>=${y} | equity=${equity.toFixed(2)}`);
+      notifyTelegram(`🟥 SHORT LMT ${symbol} qty=${qty} @ ${lmtShort.toFixed(2)} | upStreak>=${y}`);
       saveState();
     }
   }
@@ -498,19 +527,11 @@ async function maybeExitOnSample(samplePrice: number) {
   let shouldExit = false;
   if (mode === "long") {
     if (upStreak >= y) {
-      if (allowUnprofitableRuleExit) {
-        shouldExit = true;
-      } else {
-        shouldExit = pnlNow >= minProfitEUR;
-      }
+      shouldExit = allowUnprofitableRuleExit ? true : (pnlNow >= minProfitEUR);
     }
   } else {
     if (downStreak >= y) {
-      if (allowUnprofitableRuleExit) {
-        shouldExit = true;
-      } else {
-        shouldExit = pnlNow >= minProfitEUR;
-      }
+      shouldExit = allowUnprofitableRuleExit ? true : (pnlNow >= minProfitEUR);
     }
   }
   if (!shouldExit) return;
@@ -521,7 +542,7 @@ async function maybeExitOnSample(samplePrice: number) {
   if (!currentOcaGroup) currentOcaGroup = `POS_${symbol}_${Date.now()}`;
 
   if (mode === "long") {
-    const lmt = chooseSellLimitForLong(bidPrice, entryPrice, samplePrice);
+    const lmt = chooseSellLimitForLong(bidPrice, entryPrice, samplePrice); // already rounded down
     const order: any = { action: "SELL", totalQuantity: qtyToExit, orderType: "LMT", lmtPrice: lmt, tif: "DAY", transmit: true, ocaGroup: currentOcaGroup, ocaType: 1 };
     const oid = placeOrderSafe(ibStockContract(symbol), order, "SELL", "EXIT", "RULE", qtyToExit, currentOcaGroup);
     if (oid < 0) return;
@@ -530,7 +551,7 @@ async function maybeExitOnSample(samplePrice: number) {
     notifyTelegram(`↘️ RULE SELL LMT ${symbol} qty=${qtyToExit} @ ${lmt.toFixed(2)} | upStreak=${upStreak} | uPnL=${usd(pnlNow)} (minProfit=${usd(minProfitEUR)})`);
     saveState();
   } else {
-    const lmt = chooseCoverLimitForShort(askPrice, entryPrice, samplePrice);
+    const lmt = chooseCoverLimitForShort(askPrice, entryPrice, samplePrice); // already rounded up
     const order: any = { action: "BUY", totalQuantity: qtyToExit, orderType: "LMT", lmtPrice: lmt, tif: "DAY", transmit: true, ocaGroup: currentOcaGroup, ocaType: 1 };
     const oid = placeOrderSafe(ibStockContract(symbol), order, "BUY", "EXIT", "RULE", qtyToExit, currentOcaGroup);
     if (oid < 0) return;
@@ -563,7 +584,7 @@ async function checkTakeOnTick() {
   if (!currentOcaGroup) currentOcaGroup = `POS_${symbol}_${Date.now()}`;
 
   if (mode === "long") {
-    const lmt = chooseSellLimitForLong(bidPrice, entryPrice, price);
+    const lmt = chooseSellLimitForLong(bidPrice, entryPrice, price); // rounded down
     const order: any = { action: "SELL", totalQuantity: qtyToExit, orderType: "LMT", lmtPrice: lmt, tif: "DAY", transmit: true, ocaGroup: currentOcaGroup, ocaType: 1 };
     const oid = placeOrderSafe(ibStockContract(symbol), order, "SELL", "EXIT", "TAKE", qtyToExit, currentOcaGroup);
     if (oid < 0) return;
@@ -572,7 +593,7 @@ async function checkTakeOnTick() {
     notifyTelegram(`🎯 TAKE SELL LMT ${symbol} qty=${qtyToExit} @ ${lmt.toFixed(2)} | uPnL=${usd(pnlNow)} | target=${usd(target)} (takeAmt=${usd(takeAmt)})`);
     saveState();
   } else {
-    const lmt = chooseCoverLimitForShort(askPrice, entryPrice, price);
+    const lmt = chooseCoverLimitForShort(askPrice, entryPrice, price); // rounded up
     const order: any = { action: "BUY", totalQuantity: qtyToExit, orderType: "LMT", lmtPrice: lmt, tif: "DAY", transmit: true, ocaGroup: currentOcaGroup, ocaType: 1 };
     const oid = placeOrderSafe(ibStockContract(symbol), order, "BUY", "EXIT", "TAKE", qtyToExit, currentOcaGroup);
     if (oid < 0) return;
